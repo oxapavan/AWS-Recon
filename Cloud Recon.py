@@ -1,249 +1,295 @@
-import argparse
-import json
-import sys
-from datetime import datetime
-import boto3
-from botocore.exceptions import ClientError, NoCredentialsError, NoRegionError
+#!/bin/bash
 
-class AWSScanner:
-    def __init__(self, profile_name):
-        self.profile_name = profile_name
-        self.output_file = f"{profile_name}_enum_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
-        self.colors = {
-            'GREEN': '\033[0;32m',
-            'YELLOW': '\033[0;33m',
-            'RED': '\033[0;31m',
-            'NC': '\033[0m'  # No Color
-        }
-        
-        try:
-            self.session = boto3.Session(profile_name=self.profile_name)
-            self.sts_client = self.session.client('sts')
-            self.iam_client = self.session.client('iam')
-            self.s3_client = self.session.client('s3')
-            self.ec2_client = self.session.client('ec2')
-        except (NoCredentialsError, NoRegionError) as e:
-            self.print_error(f"Configuration error: {str(e)}")
-            sys.exit(1)
+# Check if profile name is provided as command-line argument
+if [ $# -ne 1 ]; then
+    echo -e "\033[0;31mUsage: $0 <profile_name>\033[0m"
+    exit 1
+fi
 
-    def print_color(self, message, color):
-        """Print colored message to console and write raw text to file"""
-        if color not in self.colors:
-            color = 'NC'
-        colored_message = f"{self.colors[color]}{message}{self.colors['NC']}"
-        print(colored_message)
-        
-        # Write to file without color codes
-        with open(self.output_file, 'a') as f:
-            f.write(f"{message}\n")
+# Define colors
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
 
-    def print_error(self, message):
-        self.print_color(message, 'RED')
+profile_name="$1"
+current_time=$(date +"%Y-%m-%d_%H-%M-%S")
+output_file="${profile_name}_enum_${current_time}.txt"
 
-    def print_warning(self, message):
-        self.print_color(message, 'YELLOW')
+# Function to perform IAM enumerations
 
-    def print_success(self, message):
-        self.print_color(message, 'GREEN')
+iam_enumeration() {
+    echo -e "${YELLOW}IAM Enumeration:${NC}"
 
-    def get_caller_identity(self):
-        try:
-            response = self.sts_client.get_caller_identity()
-            return response['Arn'].split('/')[1]
-        except ClientError as e:
-            self.print_error(f"Error getting caller identity: {str(e)}")
-            return None
+    # Get account summary
+    echo -e "${YELLOW}[!] Checking Account Summary:${NC}"
+    account_summary=$(aws iam get-account-summary --profile "$profile_name" 2>&1)
+    if echo "$account_summary" | grep -q "AccessDenied"; then
+        echo -e "${RED}[-] Access Denied${NC}\n"
+    else
+        echo -e "${GREEN}[+] Account Summary:${NC}" | tee -a "$output_file"
+        echo "$account_summary" | jq -r '.SummaryMap | 
+            "Policies: \(.Policies)\nInstanceProfiles: \(.InstanceProfiles)\nUsers: \(.Users)\nAccountMFAEnabled: \(.AccountMFAEnabled)\nAccessKeysPerUserQuota: \(.AccessKeysPerUserQuota)\nGroups: \(.Groups)\nMFADevices: \(.MFADevices)\nRoles: \(.Roles)\n"' | tee -a "$output_file"
+    fi
 
-    def iam_enumeration(self, username):
-        self.print_warning("\nIAM Enumeration:")
+    echo -e "${YELLOW}[!] Listing Groups for User:${NC}"
+    groups=$(aws iam list-groups-for-user --profile "$profile_name" --user-name "$1" 2>&1)
+    if echo "$groups" | grep -q "AccessDenied"; then
+        echo -e "${RED}[-] Access Denied${NC}\n"
+    else
+        group_names=$(echo "$groups" | jq -r '.Groups[].GroupName')
+        if [ -z "$group_names" ]; then
+            echo -e "${RED}[-] No groups found${NC}\n"
+        else
+            echo -e "${GREEN}[+] Groups found:${NC}" | tee -a "$output_file"
+            echo "$group_names" | tee -a "$output_file"
+            echo "" | tee -a "$output_file"
 
-        # Account Summary
-        try:
-            summary = self.iam_client.get_account_summary()
-            self.print_success("[+] Account Summary:")
-            summary_data = summary['SummaryMap']
-            formatted_summary = (
-                f"Policies: {summary_data.get('Policies', 'N/A')}\n"
-                f"InstanceProfiles: {summary_data.get('InstanceProfiles', 'N/A')}\n"
-                f"Users: {summary_data.get('Users', 'N/A')}\n"
-                f"AccountMFAEnabled: {summary_data.get('AccountMFAEnabled', 'N/A')}\n"
-                f"AccessKeysPerUserQuota: {summary_data.get('AccessKeysPerUserQuota', 'N/A')}\n"
-                f"Groups: {summary_data.get('Groups', 'N/A')}\n"
-                f"MFADevices: {summary_data.get('MFADevices', 'N/A')}\n"
-                f"Roles: {summary_data.get('Roles', 'N/A')}\n"
-            )
-            self.print_color(formatted_summary, 'GREEN')
-        except ClientError as e:
-            self.print_error(f"[-] Access Denied: {str(e)}")
+            # Iterate over each group to list attached policies
+            for group in $group_names; do
+                echo -e "    ${YELLOW}[!] Listing policies for group: $group${NC}"
+                group_policies=$(aws iam list-attached-group-policies --profile "$profile_name" --group-name "$group" 2>&1)
+                if echo "$group_policies" | grep -q "AccessDenied"; then
+                    echo -e "    ${RED}[-] Access Denied${NC}\n"
+                else
+                    attached_policies=$(echo "$group_policies" | jq -r '.AttachedPolicies[].PolicyArn')
+                    if [ -z "$attached_policies" ]; then
+                        echo -e "    ${RED}[-] No attached policies found for group: $group${NC}\n"
+                    else
+                        echo -e "    ${GREEN}[+] Attached Policies for group $group:${NC}" | tee -a "$output_file"
+                        echo "$attached_policies" | sed 's/^/        /' | tee -a "$output_file"
+                        echo "" | tee -a "$output_file"
 
-        # User Groups and Policies
-        try:
-            groups = self.iam_client.list_groups_for_user(UserName=username)
-            if not groups['Groups']:
-                self.print_error("[-] No groups found")
-                return
+                        # Iterate over each attached policy to get its details
+                        for policy_arn in $attached_policies; do
+                            echo -e "        ${YELLOW}[!] Getting policy details for: $policy_arn${NC}"
+                            policy_version=$(aws iam get-policy --profile "$profile_name" --policy-arn "$policy_arn" --query 'Policy.DefaultVersionId' --output text)
+                            policy_document=$(aws iam get-policy-version --profile "$profile_name" --policy-arn "$policy_arn" --version-id "$policy_version" --query 'PolicyVersion.Document' --output json)
+                            if echo "$policy_document" | grep -q "AccessDenied"; then
+                                echo -e "        ${RED}[-] Access Denied${NC}\n"
+                            else
+                                echo -e "        ${GREEN}[+] Policy document for $policy_arn:${NC}" | tee -a "$output_file"
+                                echo "$policy_document" | jq -r '.Statement[] | 
+                                    "            Effect: \(.Effect)\n            Principal: \(.Principal // "N/A")\n            Action: \(.Action)\n            Resource: \(.Resource)\n"' | tee -a "$output_file"
+                            fi
+                        done
+                    fi
+                fi
 
-            self.print_success("[+] Groups found:")
-            for group in groups['Groups']:
-                group_name = group['GroupName']
-                self.print_color(f"  {group_name}", 'GREEN')
+                # List inline policies for the group
+                echo -e "    ${YELLOW}[!] Listing inline policies for group: $group${NC}"
+                inline_policies=$(aws iam list-group-policies --profile "$profile_name" --group-name "$group" --query 'PolicyNames' --output text)
+                if [ -z "$inline_policies" ]; then
+                    echo -e "    ${RED}[-] No inline policies found for group: $group${NC}\n"
+                else
+                    echo -e "    ${GREEN}[+] Inline Policies for group $group:${NC}" | tee -a "$output_file"
+                    echo "$inline_policies" | sed 's/^/        /' | tee -a "$output_file"
+                    echo "" | tee -a "$output_file"
 
-                # Attached group policies
-                attached_policies = self.iam_client.list_attached_group_policies(
-                    GroupName=group_name
-                )
-                self.process_policies(attached_policies, group_name, 'group')
+                    # Iterate over each inline policy to get its details
+                    for inline_policy in $inline_policies; do
+                        echo -e "        ${YELLOW}[!] Getting inline policy details for: $inline_policy${NC}"
+                        policy_document=$(aws iam get-group-policy --profile "$profile_name" --group-name "$group" --policy-name "$inline_policy" --query 'PolicyDocument' --output json)
+                        if echo "$policy_document" | grep -q "AccessDenied"; then
+                            echo -e "        ${RED}[-] Access Denied${NC}\n"
+                        else
+                            echo -e "        ${GREEN}[+] Inline Policy document for $inline_policy in group $group:${NC}" | tee -a "$output_file"
+                            echo "$policy_document" | jq -r '.Statement[] | 
+                                "            Effect: \(.Effect)\n            Principal: \(.Principal // "N/A")\n            Action: \(.Action)\n            Resource: \(.Resource)\n"' | tee -a "$output_file"
+                        fi
+                    done
+                fi
+            done
+        fi
+    fi
 
-                # Inline group policies
-                inline_policies = self.iam_client.list_group_policies(GroupName=group_name)
-                self.process_inline_policies(inline_policies, group_name, 'group')
+    echo -e "${YELLOW}[!] List Attached User Policies:${NC}"
+    attached_policies=$(aws iam list-attached-user-policies --profile "$profile_name" --user-name "$1" --query 'AttachedPolicies[].PolicyName' --output text 2>&1)
+    if echo "$attached_policies" | grep -q "AccessDenied"; then
+        echo -e "${RED}[-] Access Denied${NC}\n"
+    else
+        if [ -z "$attached_policies" ]; then
+            echo -e "${RED}[-] No attached policies found.${NC}\n" 
+        else
+            echo -e "${GREEN}[+] Attached User Policies found:${NC}" | tee -a "$output_file"
+            echo "$attached_policies" | tr '\t' '\n' | tee -a "$output_file"
+            echo "" | tee -a "$output_file"
 
-        except ClientError as e:
-            self.print_error(f"[-] Error listing groups: {str(e)}")
 
-    def process_policies(self, policies, entity_name, entity_type):
-        if not policies.get('AttachedPolicies'):
-            self.print_error(f"  [-] No attached policies found for {entity_type} {entity_name}")
-            return
+        fi
+    fi
 
-        self.print_success(f"  [+] Attached Policies for {entity_type} {entity_name}:")
-        for policy in policies['AttachedPolicies']:
-            policy_arn = policy['PolicyArn']
-            self.print_color(f"    {policy_arn}", 'GREEN')
+    echo -e "${YELLOW}[!] List User Policies:${NC}"
+    policies=$(aws iam list-user-policies --profile "$profile_name" --user-name "$1" --query 'PolicyNames[]' --output text 2>&1)
+    if [[ "$policies" == *"AccessDenied"* ]]; then
+        echo -e "${RED}[-] Access Denied${NC}\n"
+    elif [ -n "$policies" ]; then
+        echo -e "${GREEN}[+] User Policies found:${NC}" | tee -a "$output_file"
+        echo "$policies" | tr '\t' '\n' | tee -a "$output_file"
+        echo "" | tee -a "$output_file"
+
+        # Iterate through each policy and get its details
+        for policy in $policies; do
+            echo -e "\t${YELLOW}[!] Getting details for policy: $policy${NC}"
+            policy_details=$(aws iam get-user-policy --profile "$profile_name" --user-name "$1" --policy-name "$policy" --query 'PolicyDocument' --output json 2>&1)
             
-            try:
-                policy_ver = self.iam_client.get_policy(PolicyArn=policy_arn)['Policy']['DefaultVersionId']
-                policy_doc = self.iam_client.get_policy_version(
-                    PolicyArn=policy_arn,
-                    VersionId=policy_ver
-                )['PolicyVersion']['Document']
-                
-                self.print_policy_statements(policy_doc)
-                
-            except ClientError as e:
-                self.print_error(f"    [-] Error getting policy: {str(e)}")
+            if [[ "$policy_details" == *"AccessDenied"* ]]; then
+                echo -e "\t${RED}[-] Access Denied for policy: $policy${NC}\n"
+            else
+                echo -e "\t${GREEN}[+] Policy Details for $policy:${NC}" | tee -a "$output_file"
+                echo "$policy_details" | jq -r '
+                    .Statement[] | 
+                    "\tEffect: \(.Effect)\n\tAction: \(.Action | if type=="array" then join(", ") else . end)\n\tResource: \(.Resource | if type=="array" then join(", ") else . end)\n"
+                ' | tee -a "$output_file"
+            fi
+        done
+    else
+        echo -e "${RED}[-] No user policies found.${NC}\n"
+    fi
 
-    def process_inline_policies(self, policies, entity_name, entity_type):
-        if not policies.get('PolicyNames'):
-            self.print_error(f"  [-] No inline policies found for {entity_type} {entity_name}")
-            return
+    # Function to list roles available to assume
+    echo -e "${YELLOW}[!] Roles available to assume:${NC}"
+    roles=$(aws iam list-roles --profile "$profile_name" --query 'Roles[].RoleName' --output json 2>&1)
+    if echo "$roles" | grep -q "AccessDenied"; then
+        echo -e "${RED}[-] Access Denied${NC}\n" 
+    else
+        role_names=$(echo "$roles" | jq -r '.[]' | tr '\n' ' ')
+        if [ -z "$role_names" ]; then
+            echo -e "${RED}[-] No roles available to assume${NC}\n" 
+        else
+            echo -e "${GREEN}[+] Roles found:${NC}"| tee -a "$output_file"
+            echo "$role_names" | tr ' ' '\n' | tee -a "$output_file"   
+        fi
+    fi
+}
 
-        self.print_success(f"  [+] Inline Policies for {entity_type} {entity_name}:")
-        for policy_name in policies['PolicyNames']:
-            try:
-                if entity_type == 'group':
-                    policy_doc = self.iam_client.get_group_policy(
-                        GroupName=entity_name,
-                        PolicyName=policy_name
-                    )['PolicyDocument']
-                else:
-                    policy_doc = self.iam_client.get_user_policy(
-                        UserName=entity_name,
-                        PolicyName=policy_name
-                    )['PolicyDocument']
-                
-                self.print_color(f"    {policy_name}", 'GREEN')
-                self.print_policy_statements(policy_doc)
-                
-            except ClientError as e:
-                self.print_error(f"    [-] Error getting inline policy: {str(e)}")
 
-    def print_policy_statements(self, policy_doc):
-        for statement in policy_doc.get('Statement', []):
-            effect = statement.get('Effect', 'N/A')
-            actions = ', '.join(statement['Action']) if isinstance(statement['Action'], list) else statement.get('Action', 'N/A')
-            resources = ', '.join(statement['Resource']) if isinstance(statement['Resource'], list) else statement.get('Resource', 'N/A')
-            
-            output = (
-                f"        Effect: {effect}\n"
-                f"        Action: {actions}\n"
-                f"        Resource: {resources}\n"
-            )
-            self.print_color(output, 'GREEN')
+# Function to perform S3 enumerations
+s3_enumeration() {
+    echo -e "${YELLOW}S3 Enumeration:${NC}"
+    echo -e "${YELLOW}[!] List S3 Buckets:${NC}"
+    list_buckets_output=$(aws s3 ls --profile "$profile_name" 2>&1)
+    if [ -z "$list_buckets_output" ]; then
+        echo -e "${RED}[-] No buckets found${NC}"
+        echo -e "${RED}[-] Skipping S3 Enumeration${NC}\n"
+        return
+    elif echo "$list_buckets_output" | grep -q "AccessDenied"; then
+        echo -e "${RED}[-] Access Denied${NC}"
+        echo -e "${RED}[-] Skipping S3 Enumeration${NC}\n"
+        return
+    else
+        echo -e "${GREEN}[+] Buckets found:${NC}" | tee -a "$output_file"
+        echo "$list_buckets_output" | tee -a "$output_file"
+        echo "" | tee -a "$output_file"
+    fi
 
-    def s3_enumeration(self):
-        self.print_warning("\nS3 Enumeration:")
-        
-        try:
-            buckets = self.s3_client.list_buckets()['Buckets']
-            if not buckets:
-                self.print_error("[-] No buckets found")
-                return
+    buckets=$(aws s3api list-buckets --profile "$profile_name" --query 'Buckets[].Name' --output text 2>&1)
+    if [[ "$buckets" == *"AccessDenied"* ]]; then
+        echo -e "${RED}[-] Access Denied while listing buckets${NC}\n"
+        return
+    fi
 
-            self.print_success("[+] Buckets found:")
-            for bucket in buckets:
-                bucket_name = bucket['Name']
-                self.print_color(f"  {bucket_name}", 'GREEN')
-                
-                # Bucket Policy
-                try:
-                    policy = self.s3_client.get_bucket_policy(Bucket=bucket_name)
-                    self.print_policy(policy.get('Policy'))
-                except ClientError as e:
-                    if e.response['Error']['Code'] == 'NoSuchBucketPolicy':
-                        self.print_error("  [-] No bucket policy")
-                    else:
-                        self.print_error(f"  [-] Error getting policy: {str(e)}")
-                
-                # Bucket ACL
-                try:
-                    acl = self.s3_client.get_bucket_acl(Bucket=bucket_name)
-                    self.process_acl(acl)
-                except ClientError as e:
-                    self.print_error(f"  [-] Error getting ACL: {str(e)}")
+    for bucket in $buckets; do
+        echo -e "${YELLOW}\t[!] Checking S3 Bucket Policy for bucket: $bucket${NC}"
 
-        except ClientError as e:
-            self.print_error(f"[-] S3 Access Denied: {str(e)}")
+        # Get bucket policy
+        bucket_policy=$(aws s3api get-bucket-policy --profile "$profile_name" --bucket "$bucket" 2>&1)
 
-    def process_acl(self, acl):
-        for grant in acl.get('Grants', []):
-            grantee = grant.get('Grantee', {})
-            permission = grant.get('Permission', 'N/A')
-            grantee_id = grantee.get('ID', 'N/A')
-            self.print_color(f"    ID: {grantee_id}, Permission: {permission}", 'GREEN')
+        if echo "$bucket_policy" | grep -q "AccessDenied"; then
+            echo -e "${RED}\t[-] Access Denied${NC}\n"
+        elif echo "$bucket_policy" | grep -q "NoSuchBucketPolicy"; then
+            echo -e "${RED}\t[-] The bucket policy for bucket: $bucket - does not exist${NC}\n"
+        else
+            echo -e "${GREEN}\t[+] Bucket Policy found for bucket: $bucket${NC}" | tee -a "$output_file"
+            echo "$bucket_policy" | jq -r '.Policy | fromjson | .Statement[] | 
+                "\tEffect: \(.Effect)\n\tPrincipal: \(.Principal | if type=="object" then (. | to_entries[] | "\t\(.key): \(.value | if type == "array" then join(", ") else . end)") else . end)\n\tAction: \(.Action | if type=="array" then join(", ") else . end)\n\tResource: \(.Resource | if type=="array" then join(", ") else . end)\n"' | tee -a "$output_file"
+        fi
+    done
 
-    def ec2_enumeration(self):
-        self.print_warning("\nEC2 Enumeration:")
-        
-        try:
-            instances = self.ec2_client.describe_instances()['Reservations']
-            if not instances:
-                self.print_error("[-] No EC2 instances found")
-                return
+    for bucket in $buckets; do
+        echo -e "${YELLOW}[!] Checking Bucket ACLs for bucket: $bucket${NC}"
+        acl_output=$(aws s3api get-bucket-acl --profile "$profile_name" --bucket "$bucket" 2>&1)
+        if echo "$acl_output" | grep -q "AccessDenied"; then
+            echo -e "${RED}[-] Access Denied${NC}\n"
+        else
+            echo -e "${GREEN}[+] ACL found for bucket: $bucket${NC}" | tee -a "$output_file"
+            echo "$acl_output" | jq -r '.Grants[] | 
+                "ID: \(.Grantee.ID // "N/A")\nPermission: \(.Permission)"' | tee -a "$output_file"
+            echo "" | tee -a "$output_file" 
+        fi
+    done
+}
 
-            self.print_success("[+] EC2 Instances found:")
-            for idx, reservation in enumerate(instances, 1):
-                for instance in reservation['Instances']:
-                    self.print_instance_details(instance, idx)
-        except ClientError as e:
-            self.print_error(f"[-] EC2 Access Denied: {str(e)}")
 
-    def print_instance_details(self, instance, idx):
-        name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
-        output = (
-            f"{idx}. Instance Name: {name}\n"
-            f"   Instance ID: {instance['InstanceId']}\n"
-            f"   State: {instance['State']['Name']}\n"
-            f"   Private IP: {instance.get('PrivateIpAddress', 'N/A')}\n"
-        )
-        self.print_color(output, 'GREEN')
+# Function to perform EC2 enumerations
+ec2_enumeration() {
+    echo -e "${YELLOW}EC2 Enumeration:${NC}"
+    echo -e "${YELLOW}[!] Describe EC2 Instances:${NC}"
 
-    def run(self):
-        username = self.get_caller_identity()
-        if not username:
-            self.print_error("[-] Couldn't determine username")
-            return
+    ec2_output=$(aws ec2 describe-instances --profile "$profile_name" 2>&1)
 
-        self.print_success(f"\n[+] Username: {username}")
-        self.iam_enumeration(username)
-        self.s3_enumeration()
-        self.ec2_enumeration()
-        self.print_color("\nScan completed. Results saved to: " + self.output_file, 'GREEN')
+    # Check if the ec2_output is empty or contains an error
+    if [ -z "$ec2_output" ]; then
+        echo -e "${RED}[-] No EC2 instances found${NC}\n" 
+        return
+    elif echo "$ec2_output" | grep -q "UnauthorizedOperation"; then
+        echo -e "${RED}[-] UnauthorizedOperation${NC}\n" 
+        exit 1
+    fi
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='AWS Environment Scanner')
-    parser.add_argument('profile_name', help='AWS profile name')
-    args = parser.parse_args()
+    # Parse the required information using jq
+    instance_info=$(echo "$ec2_output" | jq -r '
+    .Reservations[] | .Instances[] | {
+        Name: (.Tags[]? | select(.Key == "Name") | .Value // "N/A"),
+        Groups: (.SecurityGroups[]? | .GroupName),
+        SecurityGroups: [.SecurityGroups[].GroupName],
+        InstanceID: .InstanceId,
+        AvailabilityZone: .Placement.AvailabilityZone,
+        State: .State.Name,
+        LaunchTime: .LaunchTime,
+        PrivateIP: .PrivateIpAddress,
+        VPCID: .VpcId,
+        SUBNETID: .SubnetId,
+        VOLUMEID: (.BlockDeviceMappings[]?.Ebs.VolumeId // "N/A"),
+        OWNERID: (.NetworkInterfaces[0].OwnerId // "N/A")
+    }' | jq -r '
+        "Instance Name: \(.Name)",
+        "Groups: \(.Groups // "N/A")",
+        "Security Groups: \(.SecurityGroups | join(", "))",
+        "Instance ID: \(.InstanceID)",
+        "Availability Zone: \(.AvailabilityZone)",
+        "State: \(.State)",
+        "LaunchTime: \(.LaunchTime)",
+        "PrivateIP: \(.PrivateIP)",
+        "VPCID: \(.VPCID)",
+        "SUBNETID: \(.SUBNETID)",
+        "VOLUMEID: \(.VOLUMEID)",
+        "OWNERID: \(.OWNERID)"
+    ')
 
-    scanner = AWSScanner(args.profile_name)
-    scanner.run()
+    # Number only the different EC2 instance names
+    instance_info_with_numbers=$(echo "$instance_info" | awk '/Instance Name:/ {if (++count > 1) print ""; print count ". " $0; next} {print}')
+
+    # Output the parsed information 
+    if [ -z "$instance_info_with_numbers" ]; then
+        echo -e "${RED}[-] No EC2 instances found${NC}\n"
+    else
+        echo -e "${GREEN}[+] EC2 Info found:${NC}" | tee -a "$output_file"
+        echo -e "$instance_info_with_numbers" | tee -a "$output_file"
+    fi
+
+}
+
+main() {
+    # Get caller identity to extract username
+    caller_identity=$(aws sts get-caller-identity --profile "$profile_name")
+    username=$(echo "$caller_identity" | jq -r '.Arn' | awk -F '/' '{print $2}')
+    echo -e "${GREEN}[+] Username: $username${NC}\n" | tee -a "$output_file"
+
+    iam_enumeration "$username"
+    s3_enumeration
+    ec2_enumeration
+
+}
+
+main
